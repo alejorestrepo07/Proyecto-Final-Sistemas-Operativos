@@ -81,6 +81,34 @@ krefcnt(void *pa)
   return n;
 }
 
+// Numero de paginas en la lista libre.
+uint64
+kfreepages(void)
+{
+  struct run *r;
+  uint64 n = 0;
+
+  acquire(&kmem.lock);
+  for (r = kmem.freelist; r; r = r->next)
+    n++;
+  release(&kmem.lock);
+  return n;
+}
+
+// Numero de paginas fisicas con mas de una referencia.
+uint64
+ksharedpages(void)
+{
+  uint64 n = 0;
+
+  acquire(&refs.lock);
+  for (int i = 0; i < NPAGES; i++)
+    if (refs.cnt[i] > 1)
+      n++;
+  release(&refs.lock);
+  return n;
+}
+
 // Quita una referencia a la pagina de memoria fisica pa. Solo cuando
 // llega a 0 la devuelve a la lista libre.  pa normalmente viene de
 // kalloc(); la excepcion es freerange(), que le fija 1 antes de llamar.
