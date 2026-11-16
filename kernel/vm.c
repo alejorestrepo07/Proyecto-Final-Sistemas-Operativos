@@ -355,10 +355,13 @@ err:
 // Atiende una escritura sobre una pagina CoW de pagetable en va.
 // Con mas de una referencia copia la pagina; con una sola, solo
 // devuelve PTE_W. Retorna 0 si resolvio el fallo, -1 si la pagina
-// no es CoW o no hay memoria para copiarla.
+// no es CoW o no hay memoria para copiarla. Los fallos resueltos se
+// cuentan en el proceso actual: usertrap() y copyout() siempre llegan
+// aqui con la tabla de paginas de myproc().
 int
 cowfault(pagetable_t pagetable, uint64 va)
 {
+  struct proc *p = myproc();
   pte_t *pte;
   uint64 pa;
   char *mem;
@@ -378,10 +381,12 @@ cowfault(pagetable_t pagetable, uint64 va)
     memmove(mem, (char *)pa, PGSIZE);
     *pte = PA2PTE(mem) | ((PTE_FLAGS(*pte) | PTE_W) & ~PTE_COW);
     kfree((void *)pa); // quita la referencia de este proceso
+    p->cowcopies++;
   } else {
     // unica referencia: el otro proceso ya copio o ya termino
     *pte = (*pte | PTE_W) & ~PTE_COW;
   }
+  p->cowfaults++;
   sfence_vma();
   return 0;
 }
