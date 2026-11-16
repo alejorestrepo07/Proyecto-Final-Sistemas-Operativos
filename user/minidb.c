@@ -11,11 +11,14 @@
 // Estudien consulta(): es el modelo de multiprogramación del proyecto
 // (varios hijos con fork(), un pipe por hijo, el padre combina).
 #include "kernel/types.h"
+#include "kernel/stat.h"
 #include "kernel/riscv.h"
 #include "kernel/fcntl.h"
 #include "kernel/cowstat.h"
 #include "user/user.h"
 #include "user/minidb.h"
+
+#define NPAGINAS (NCUENTAS * sizeof(struct cuenta) / PGSIZE) // 64 páginas
 
 static struct cuenta *tabla;
 
@@ -173,8 +176,7 @@ consulta(int k)
 // directamente desde la tabla. El hijo solo lee la tabla, así que ve la
 // foto del fork() y no provoca copias CoW. Termina con exit(0) si todo
 // salió bien.
-// (__attribute__((unused)) evita la advertencia mientras no se llame.)
-static void __attribute__((unused))
+static void
 guardar_snapshot(uint checksum)
 {
   struct snap_encabezado enc = { SNAP_MAGIA, NCUENTAS, checksum, 0 };
@@ -190,26 +192,103 @@ guardar_snapshot(uint checksum)
   exit(0);
 }
 
-// TODO (Parte C.2): implementen el snapshot consistente.
-//  1. Calcular checksum_tabla() y el saldo total; imprimir checksum_inicial.
-//  2. Limpiar los bits PTE_A de la tabla con pgaccess() (64 páginas).
-//  3. fork(): el hijo llama a guardar_snapshot(); el padre imprime la
-//     línea "snapshot: hijo pid=..." y NO espera al hijo todavía.
-//  4. El padre aplica m transferencias con generar_transferencia()
-//     (semilla inicial 4), midiendo cowstat() antes y después.
-//  5. pgaccess() para contar las páginas tocadas; imprimir las líneas
-//     "transferencias=..." y "paginas_tocadas=...".
-//  6. wait(), releer snap.db (usen sbrk() para el buffer: la pila es de
-//     una sola página), verificar encabezado y checksum, verificar que el
-//     saldo total se conservó e imprimir "snapshot: OK" o "snapshot: FALLO".
-// El formato exacto de cada línea está en el Anexo B del enunciado.
+static uint64
+saldo_total(void)
+{
+  uint64 total = 0;
+  for(int i = 0; i < NCUENTAS; i++)
+    total += tabla[i].saldo;
+  return total;
+}
+
+// Snapshot consistente: el hijo guarda la tabla tal como estaba en el
+// fork() mientras el padre sigue aplicando transferencias. Copy-on-Write
+// separa las dos vistas: solo se copian las páginas que el padre escribe.
 static void
 snapshot(int m)
 {
-  (void)m;
+  if(m < 0)
+    morir("M debe ser >= 0");
   cargar_tabla();
-  printf("snapshot: FALLO (sin implementar)\n");
-  exit(1);
+  uint checksum0 = checksum_tabla(tabla, NCUENTAS);
+  uint64 total0 = saldo_total();
+  printf("snapshot: checksum_inicial=0x%x\n", checksum0);
+
+  // Limpiar los bits de acceso para contar solo lo que toquen las
+  // transferencias.
+  uint64 mask;
+  if(pgaccess(tabla, NPAGINAS, &mask) < 0)
+    morir("pgaccess() falló");
+
+  int pid = fork();
+  if(pid < 0)
+    morir("fork() falló");
+  if(pid == 0)
+    guardar_snapshot(checksum0);
+  printf("snapshot: hijo pid=%d escribiendo %s\n", pid, SNAP_ARCHIVO);
+
+  // El padre no espera al hijo: aplica las transferencias de inmediato.
+  struct cowstat st0, st1;
+  if(cowstat(&st0) < 0)
+    morir("cowstat() falló");
+  uint semilla = 4;
+  int aplicadas = 0;
+  for(int i = 0; i < m; i++){
+    struct transferencia t;
+    generar_transferencia(&semilla, &t);
+    struct cuenta *o = &tabla[t.origen], *d = &tabla[t.destino];
+    if(t.origen == t.destino || o->saldo < t.monto)
+      continue;
+    o->saldo -= t.monto;
+    d->saldo += t.monto;
+    o->nmov++;
+    d->nmov++;
+    aplicadas++;
+  }
+  if(cowstat(&st1) < 0)
+    morir("cowstat() falló");
+  if(pgaccess(tabla, NPAGINAS, &mask) < 0)
+    morir("pgaccess() falló");
+  int tocadas = 0;
+  for(int i = 0; i < NPAGINAS; i++)
+    if(mask & (1L << i))
+      tocadas++;
+  printf("snapshot: transferencias=%d aplicadas=%d rechazadas=%d\n",
+         m, aplicadas, m - aplicadas);
+  printf("snapshot: paginas_tocadas=%d fallos_cow=%ld copias_cow=%ld\n", tocadas,
+         st1.cowfaults - st0.cowfaults, st1.cowcopies - st0.cowcopies);
+
+  int estado;
+  int ok = wait(&estado) == pid && estado == 0;
+
+  // Releer snap.db. El buffer va en el heap: la pila es de una página.
+  int n = sizeof(struct snap_encabezado) + NCUENTAS * sizeof(struct cuenta);
+  char *buf = sbrk(n);
+  if(buf == (char *)-1)
+    morir("sbrk() falló");
+  struct snap_encabezado *enc = (struct snap_encabezado *)buf;
+  struct cuenta *guardadas = (struct cuenta *)(buf + sizeof(*enc));
+  struct stat s;
+  int fd = open(SNAP_ARCHIVO, O_RDONLY);
+  if(fd < 0)
+    morir("no se pudo abrir snap.db");
+  if(fstat(fd, &s) < 0 || leer_todo(fd, buf, n) < 0)
+    morir("no se pudo leer snap.db");
+  close(fd);
+  uint checksum_archivo = checksum_tabla(guardadas, NCUENTAS);
+  int coincide = enc->magia == SNAP_MAGIA && enc->n == NCUENTAS &&
+                 enc->checksum == checksum0 && enc->reservado == 0 &&
+                 checksum_archivo == checksum0 && s.size == n;
+  printf("snapshot: archivo bytes=%ld checksum=0x%x coincide=%s\n",
+         s.size, checksum_archivo, coincide ? "si" : "no");
+
+  int conservado = saldo_total() == total0;
+  printf("snapshot: checksum_actual=0x%x total_conservado=%s\n",
+         checksum_tabla(tabla, NCUENTAS), conservado ? "si" : "no");
+
+  ok = ok && coincide && conservado;
+  printf("snapshot: %s\n", ok ? "OK" : "FALLO");
+  exit(ok ? 0 : 1);
 }
 
 static void
