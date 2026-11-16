@@ -168,16 +168,26 @@ consulta(int k)
 }
 
 
-// TODO (Parte C.2): el hijo escribe en SNAP_ARCHIVO un struct
-// snap_encabezado (con el checksum calculado ANTES del fork) seguido de
-// las NCUENTAS cuentas, escritas directamente desde la tabla (sin
-// copiarlas a otro buffer). Termina con exit(0) si todo salió bien.
+// Lo ejecuta el hijo del snapshot: escribe en SNAP_ARCHIVO el encabezado
+// (con el checksum calculado antes del fork) y las NCUENTAS cuentas
+// directamente desde la tabla. El hijo solo lee la tabla, así que ve la
+// foto del fork() y no provoca copias CoW. Termina con exit(0) si todo
+// salió bien.
 // (__attribute__((unused)) evita la advertencia mientras no se llame.)
 static void __attribute__((unused))
 guardar_snapshot(uint checksum)
 {
-  (void)checksum;
-  exit(1);
+  struct snap_encabezado enc = { SNAP_MAGIA, NCUENTAS, checksum, 0 };
+  int fd = open(SNAP_ARCHIVO, O_CREATE | O_WRONLY | O_TRUNC);
+  if(fd < 0)
+    exit(1);
+  if(escribir_todo(fd, &enc, sizeof(enc)) < 0 ||
+     escribir_todo(fd, tabla, NCUENTAS * sizeof(struct cuenta)) < 0){
+    close(fd);
+    exit(1);
+  }
+  close(fd);
+  exit(0);
 }
 
 // TODO (Parte C.2): implementen el snapshot consistente.
