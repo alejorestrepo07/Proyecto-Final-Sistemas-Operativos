@@ -89,13 +89,15 @@ La página de guarda de la pila es un caso particular en esta versión de xv6: `
 
 ## 3. Carrera en el conteo de referencias
 
-Sin lock, dos CPUs hacen `kfree()` de la misma página a la vez, con conteo 2:
+Sin lock, un padre y su hijo que comparten una página (conteo 2) terminan al mismo tiempo en dos CPUs, y los dos hacen `kfree()` de esa página:
 
 1. La CPU 0 lee 2 y la CPU 1 lee 2.
 2. Las dos escriben 1.
 3. El conteo queda en 1 aunque ya nadie usa la página. Nunca llega a 0, así que la página se pierde para siempre (fuga).
 
-Con `krefinc()` y `kfree()` pasa lo contrario. Si un `fork()` en la CPU 0 hace `krefinc()` (1 → 2) mientras la CPU 1 hace `kfree()` de la misma página (1 → 0), y las dos leen 1 antes de escribir, la CPU 1 escribe 0 y libera la página, y la CPU 0 escribe 2. El hijo queda mapeando una página que está en la lista libre: el siguiente `kalloc()` se la da a otro proceso y los dos escriben en la misma memoria. Por eso todos los accesos al arreglo van bajo `refs.lock`.
+Con `krefinc()` y `kfree()` puede pasar algo peor. Un padre P y su hijo C comparten la página A, con conteo 2. En la CPU 0, P hace `fork()` y `uvmcopy()` llama a `krefinc(A)`. Al mismo tiempo, en la CPU 1, C escribe en A, y `cowfault()` la copia y llama a `kfree(A)`. Las dos CPUs leen 2. La CPU 0 escribe 3 y después la CPU 1 escribe 1. Ahora A la usan dos procesos (P y su nuevo hijo), pero el conteo dice 1. Cuando uno de los dos termine, `kfree()` lo baja a 0 y devuelve A a la lista libre aunque el otro la sigue usando. El siguiente `kalloc()` se la da a otro proceso y los dos escriben en la misma memoria. Si las escrituras ocurren en el orden contrario, el conteo queda en 3 y la página nunca se libera.
+
+Esto solo puede pasar con procesos distintos, porque cada proceso de xv6 tiene un solo hilo y no puede estar en dos CPUs a la vez. Por eso todos los accesos al arreglo van bajo `refs.lock`.
 
 ## 4. Consistencia del snapshot
 
